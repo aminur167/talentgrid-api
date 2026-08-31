@@ -357,7 +357,7 @@ app.delete('/api/jobs/:id', async (req, res) => {
 // POST /api/applications — Apply for a job
 app.post('/api/applications', async (req, res) => {
   try {
-    const { jobId, applicantEmail, applicantName, coverLetter, resumeUrl } = req.body;
+    const { jobId, applicantEmail, applicantName, coverLetter, resumeUrl, expectedSalary, availability } = req.body;
     if (!jobId || !applicantEmail) {
       return res.status(400).json({
         success: false,
@@ -365,13 +365,20 @@ app.post('/api/applications', async (req, res) => {
       });
     }
 
+    const emailClean = String(applicantEmail).trim().toLowerCase();
+
+    // Check active paid subscription
     const userSubscription = await subscriptionsCollection.findOne({
-      userEmail: applicantEmail,
+      userEmail: { $regex: `^${emailClean}$`, $options: 'i' },
       status: 'active',
     });
     const isPro = userSubscription && (userSubscription.plan === 'growth' || userSubscription.plan === 'premium');
 
-    const userAppCount = await applicationsCollection.countDocuments({ applicantEmail });
+    // Count user's current applications
+    const userAppCount = await applicationsCollection.countDocuments({
+      applicantEmail: { $regex: `^${emailClean}$`, $options: 'i' }
+    });
+
     if (!isPro && userAppCount >= 3) {
       return res.status(403).json({
         success: false,
@@ -381,20 +388,42 @@ app.post('/api/applications', async (req, res) => {
       });
     }
 
-    const existing = await applicationsCollection.findOne({ jobId, applicantEmail });
+    // Check duplicate application
+    const existing = await applicationsCollection.findOne({
+      jobId,
+      applicantEmail: { $regex: `^${emailClean}$`, $options: 'i' }
+    });
+
     if (existing) {
       return res.status(409).json({ success: false, message: 'You have already applied for this job.' });
+    }
+
+    // Fetch job details to snapshot into application record
+    let jobDetails = null;
+    if (ObjectId.isValid(jobId)) {
+      jobDetails = await jobsCollection.findOne({ _id: new ObjectId(jobId) });
     }
 
     const application = {
       ...req.body,
       jobId,
-      applicantEmail,
-      applicantName: applicantName || '',
-      coverLetter: coverLetter || '',
+      jobTitle: jobDetails?.title || jobDetails?.jobTitle || req.body.jobTitle || 'Technical Position',
+      jobType: jobDetails?.jobType || req.body.jobType || 'Full-time',
+      companyId: jobDetails?.companyId || req.body.companyId || '',
+      companyName: jobDetails?.companyName || req.body.companyName || 'TalentGrid Partner',
+      companyLogo: jobDetails?.companyLogo || req.body.companyLogo || '',
+      companyLocation: jobDetails?.location || req.body.location || '',
+      applicantEmail: emailClean,
+      applicantName: (applicantName || '').trim(),
+      applicantPhone: req.body.applicantPhone || '',
+      applicantLocation: req.body.applicantLocation || '',
       resumeUrl: resumeUrl || '',
+      expectedSalary: expectedSalary || '',
+      availability: availability || 'Immediate',
+      coverLetter: coverLetter || '',
       status: 'pending',
       appliedAt: new Date(),
+      createdAt: new Date(),
       updatedAt: new Date(),
     };
 
@@ -411,6 +440,7 @@ app.post('/api/applications', async (req, res) => {
       success: true,
       message: 'Application submitted successfully!',
       applicationId: result.insertedId,
+      totalApplied: userAppCount + 1,
       remainingFreeApps: isPro ? 'unlimited' : Math.max(0, 3 - (userAppCount + 1)),
     });
   } catch (error) {
@@ -419,20 +449,47 @@ app.post('/api/applications', async (req, res) => {
   }
 });
 
-// GET /api/applications — Get applications
+// GET /api/applications — Get applications (supports case-insensitive email filter and auto-enrichment)
 app.get('/api/applications', async (req, res) => {
   try {
-    const { jobId, applicantEmail } = req.query;
+    const { jobId, applicantEmail, email } = req.query;
+    const targetEmail = (applicantEmail || email || '').trim();
     const filter = {};
     if (jobId) filter.jobId = jobId;
-    if (applicantEmail) filter.applicantEmail = applicantEmail;
+    if (targetEmail) {
+      filter.applicantEmail = { $regex: `^${targetEmail}$`, $options: 'i' };
+    }
 
     const applications = await applicationsCollection
       .find(filter)
-      .sort({ appliedAt: -1 })
+      .sort({ appliedAt: -1, createdAt: -1 })
       .toArray();
 
-    res.status(200).json({ success: true, total: applications.length, applications });
+    // Auto-enrich any older applications that might not have company/job fields populated
+    const enriched = await Promise.all(
+      applications.map(async (app) => {
+        let jobInfo = null;
+        let companyInfo = null;
+
+        if ((!app.companyName || !app.jobTitle) && app.jobId && ObjectId.isValid(app.jobId)) {
+          jobInfo = await jobsCollection.findOne({ _id: new ObjectId(app.jobId) });
+        }
+        if (!app.companyName && jobInfo?.companyId && ObjectId.isValid(jobInfo.companyId)) {
+          companyInfo = await companiesCollection.findOne({ _id: new ObjectId(jobInfo.companyId) });
+        }
+
+        return {
+          ...app,
+          jobTitle: app.jobTitle || jobInfo?.title || jobInfo?.jobTitle || 'Technical Position',
+          jobType: app.jobType || jobInfo?.jobType || 'Full-time',
+          companyName: app.companyName || companyInfo?.name || jobInfo?.companyName || 'TalentGrid Partner',
+          companyLogo: app.companyLogo || companyInfo?.logo || jobInfo?.companyLogo || '',
+          location: app.companyLocation || companyInfo?.location || jobInfo?.location || app.applicantLocation || 'Remote',
+        };
+      })
+    );
+
+    res.status(200).json({ success: true, total: enriched.length, applications: enriched });
   } catch (error) {
     console.error('GET /api/applications error:', error);
     res.status(500).json({ success: false, message: 'Failed to fetch applications.' });
