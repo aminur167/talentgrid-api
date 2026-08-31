@@ -76,6 +76,12 @@ async function initCollections() {
   }
 }
 
+// Helper to safely escape special regex characters from user inputs
+function escapeRegex(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // Middleware to ensure DB is connected before handling any route
 app.use(async (req, res, next) => {
   try {
@@ -242,14 +248,22 @@ app.get('/api/jobs', async (req, res) => {
 
     if (companyId) filter.companyId = companyId;
     if (recruiterEmail) filter.recruiterEmail = recruiterEmail;
-    if (search) filter.title = { $regex: search, $options: 'i' };
-    if (category && category !== 'All') filter.category = { $regex: category, $options: 'i' };
-    if (jobType && jobType !== 'All') filter.jobType = { $regex: `^${jobType}$`, $options: 'i' };
+    if (search && search.trim()) {
+      const safeSearch = escapeRegex(search);
+      filter.$or = [
+        { title: { $regex: safeSearch, $options: 'i' } },
+        { companyName: { $regex: safeSearch, $options: 'i' } },
+        { category: { $regex: safeSearch, $options: 'i' } },
+        { description: { $regex: safeSearch, $options: 'i' } },
+      ];
+    }
+    if (category && category !== 'All') filter.category = { $regex: escapeRegex(category), $options: 'i' };
+    if (jobType && jobType !== 'All') filter.jobType = { $regex: `^${escapeRegex(jobType)}$`, $options: 'i' };
 
     if (isRemote === 'true' || location === '@remote' || String(location).toLowerCase().includes('remote')) {
       filter.isRemote = true;
     } else if (location && location !== 'all') {
-      filter.location = { $regex: location, $options: 'i' };
+      filter.location = { $regex: escapeRegex(location), $options: 'i' };
     }
 
     if (minSalary) filter.maxSalary = { $gte: Number(minSalary) };
