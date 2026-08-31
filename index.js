@@ -784,7 +784,7 @@ app.post('/api/interviews', async (req, res) => {
         recipientEmail: applicantEmail.trim().toLowerCase(),
         title: `Interview Scheduled! 📅`,
         message: `${companyName || 'The employer'} invited you for an interview for "${jobTitle}" on ${date} at ${time} (${timezone || 'UTC'}).`,
-        type: 'interview_scheduled',
+        type: 'interview',
         link: meetingLink || '/dashboard/seeker/applications',
         isRead: false,
         createdAt: new Date(),
@@ -894,12 +894,19 @@ app.patch('/api/seeker/profile', async (req, res) => {
 
     const result = await usersCollection.updateOne(
       { email: { $regex: `^${email.trim()}$`, $options: 'i' } },
-      { $set: { ...updateFields, updatedAt: new Date() } }
+      { 
+        $set: { 
+          ...updateFields, 
+          email: email.trim().toLowerCase(),
+          updatedAt: new Date() 
+        },
+        $setOnInsert: {
+          createdAt: new Date(),
+          role: 'job_seeker'
+        }
+      },
+      { upsert: true }
     );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ success: false, message: 'User not found.' });
-    }
 
     res.status(200).json({ success: true, message: 'Profile updated successfully.' });
   } catch (error) {
