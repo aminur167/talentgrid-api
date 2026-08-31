@@ -59,17 +59,20 @@ async function getDb() {
   return cachedDb;
 }
 
-let db, jobsCollection, applicationsCollection, usersCollection, companiesCollection, tokensCollection, subscriptionsCollection;
+let db, jobsCollection, applicationsCollection, usersCollection, companiesCollection, tokensCollection, subscriptionsCollection, notificationsCollection, savedJobsCollection, interviewsCollection;
 
 async function initCollections() {
   if (!db) {
     db = await getDb();
-    jobsCollection         = db.collection('jobs');
-    applicationsCollection = db.collection('applications');
-    usersCollection        = db.collection('users');
-    companiesCollection    = db.collection('companies');
-    tokensCollection       = db.collection('tokens');
+    jobsCollection          = db.collection('jobs');
+    applicationsCollection  = db.collection('applications');
+    usersCollection         = db.collection('users');
+    companiesCollection     = db.collection('companies');
+    tokensCollection        = db.collection('tokens');
     subscriptionsCollection = db.collection('subscriptions');
+    notificationsCollection = db.collection('notifications');
+    savedJobsCollection     = db.collection('saved_jobs');
+    interviewsCollection    = db.collection('interviews');
   }
 }
 
@@ -511,19 +514,316 @@ app.patch('/api/applications/:id/status', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid status.' });
     }
 
+    const appRecord = await applicationsCollection.findOne({ _id: new ObjectId(id) });
+    if (!appRecord) {
+      return res.status(404).json({ success: false, message: 'Application not found.' });
+    }
+
     const result = await applicationsCollection.updateOne(
       { _id: new ObjectId(id) },
       { $set: { status, updatedAt: new Date() } }
     );
 
-    if (result.matchedCount === 0) {
-      return res.status(404).json({ success: false, message: 'Application not found.' });
+    // Auto-create notification for the candidate
+    if (appRecord.applicantEmail && notificationsCollection) {
+      await notificationsCollection.insertOne({
+        recipientEmail: appRecord.applicantEmail.toLowerCase(),
+        title: `Application Status: ${status.toUpperCase()} ✨`,
+        message: `Your application for ${appRecord.jobTitle || 'the position'} at ${appRecord.companyName || 'the employer'} was marked as ${status}.`,
+        type: 'status_updated',
+        link: '/dashboard/seeker/applications',
+        isRead: false,
+        createdAt: new Date(),
+      });
     }
 
     res.status(200).json({ success: true, message: `Application marked as ${status}.` });
   } catch (error) {
     console.error('PATCH /api/applications/:id/status error:', error);
     res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NOTIFICATIONS ROUTES — /api/notifications
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /api/notifications — Fetch user notifications
+app.get('/api/notifications', async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'User email is required.' });
+    }
+
+    const notifications = await notificationsCollection
+      .find({ recipientEmail: { $regex: `^${email.trim()}$`, $options: 'i' } })
+      .sort({ createdAt: -1 })
+      .limit(30)
+      .toArray();
+
+    const unreadCount = notifications.filter(n => !n.isRead).length;
+
+    res.status(200).json({
+      success: true,
+      total: notifications.length,
+      unreadCount,
+      notifications,
+    });
+  } catch (error) {
+    console.error('GET /api/notifications error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch notifications.' });
+  }
+});
+
+// POST /api/notifications — Create a custom notification
+app.post('/api/notifications', async (req, res) => {
+  try {
+    const { recipientEmail, title, message, type = 'info', link = '' } = req.body;
+    if (!recipientEmail || !title || !message) {
+      return res.status(400).json({ success: false, message: 'recipientEmail, title, and message are required.' });
+    }
+
+    const doc = {
+      recipientEmail: recipientEmail.trim().toLowerCase(),
+      title,
+      message,
+      type,
+      link,
+      isRead: false,
+      createdAt: new Date(),
+    };
+
+    const result = await notificationsCollection.insertOne(doc);
+    res.status(201).json({ success: true, message: 'Notification sent.', notificationId: result.insertedId });
+  } catch (error) {
+    console.error('POST /api/notifications error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// PATCH /api/notifications/:id/read — Mark single notification as read
+app.patch('/api/notifications/:id/read', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid notification ID.' });
+    }
+
+    await notificationsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { isRead: true, readAt: new Date() } }
+    );
+
+    res.status(200).json({ success: true, message: 'Notification marked as read.' });
+  } catch (error) {
+    console.error('PATCH /api/notifications/:id/read error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// PATCH /api/notifications/read-all — Mark all notifications as read for a user
+app.patch('/api/notifications/read-all', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+
+    await notificationsCollection.updateMany(
+      { recipientEmail: { $regex: `^${email.trim()}$`, $options: 'i' }, isRead: false },
+      { $set: { isRead: true, readAt: new Date() } }
+    );
+
+    res.status(200).json({ success: true, message: 'All notifications marked as read.' });
+  } catch (error) {
+    console.error('PATCH /api/notifications/read-all error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// DELETE /api/notifications/:id — Delete notification
+app.delete('/api/notifications/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ success: false, message: 'Invalid notification ID.' });
+    }
+
+    await notificationsCollection.deleteOne({ _id: new ObjectId(id) });
+    res.status(200).json({ success: true, message: 'Notification deleted.' });
+  } catch (error) {
+    console.error('DELETE /api/notifications/:id error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SAVED JOBS (BOOKMARKS) ROUTES — /api/saved-jobs
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /api/saved-jobs — Get saved jobs for a seeker
+app.get('/api/saved-jobs', async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'User email is required.' });
+    }
+
+    const savedRecords = await savedJobsCollection
+      .find({ userEmail: { $regex: `^${email.trim()}$`, $options: 'i' } })
+      .sort({ savedAt: -1 })
+      .toArray();
+
+    // Enrich with live job details from jobsCollection
+    const enriched = await Promise.all(
+      savedRecords.map(async (record) => {
+        let job = null;
+        if (record.jobId && ObjectId.isValid(record.jobId)) {
+          job = await jobsCollection.findOne({ _id: new ObjectId(record.jobId) });
+        }
+        return {
+          ...record,
+          job: job || record.cachedJob || null,
+        };
+      })
+    );
+
+    res.status(200).json({
+      success: true,
+      total: enriched.length,
+      savedJobs: enriched.filter(r => r.job !== null),
+      savedJobIds: savedRecords.map(r => r.jobId),
+    });
+  } catch (error) {
+    console.error('GET /api/saved-jobs error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch saved jobs.' });
+  }
+});
+
+// POST /api/saved-jobs — Toggle bookmark (save / unsave)
+app.post('/api/saved-jobs', async (req, res) => {
+  try {
+    const { email, jobId } = req.body;
+    if (!email || !jobId) {
+      return res.status(400).json({ success: false, message: 'email and jobId are required.' });
+    }
+
+    const emailClean = email.trim().toLowerCase();
+    const existing = await savedJobsCollection.findOne({
+      userEmail: { $regex: `^${emailClean}$`, $options: 'i' },
+      jobId,
+    });
+
+    if (existing) {
+      // Unsave
+      await savedJobsCollection.deleteOne({ _id: existing._id });
+      return res.status(200).json({ success: true, isSaved: false, message: 'Job removed from saved list.' });
+    } else {
+      // Save
+      let jobDetails = null;
+      if (ObjectId.isValid(jobId)) {
+        jobDetails = await jobsCollection.findOne({ _id: new ObjectId(jobId) });
+      }
+
+      await savedJobsCollection.insertOne({
+        userEmail: emailClean,
+        jobId,
+        cachedJob: jobDetails ? {
+          title: jobDetails.title,
+          companyName: jobDetails.companyName,
+          location: jobDetails.location,
+          jobType: jobDetails.jobType,
+          minSalary: jobDetails.minSalary,
+          maxSalary: jobDetails.maxSalary,
+        } : null,
+        savedAt: new Date(),
+      });
+
+      return res.status(201).json({ success: true, isSaved: true, message: 'Job saved to your bookmarks!' });
+    }
+  } catch (error) {
+    console.error('POST /api/saved-jobs error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// INTERVIEWS SCHEDULER ROUTES — /api/interviews
+// ═══════════════════════════════════════════════════════════════════════════
+
+// POST /api/interviews — Schedule interview with candidate
+app.post('/api/interviews', async (req, res) => {
+  try {
+    const { applicantEmail, recruiterEmail, candidateName, jobTitle, companyName, date, time, timezone, meetingLink, notes } = req.body;
+
+    if (!applicantEmail || !jobTitle || !date || !time) {
+      return res.status(400).json({ success: false, message: 'applicantEmail, jobTitle, date, and time are required.' });
+    }
+
+    const interviewDoc = {
+      applicantEmail: applicantEmail.trim().toLowerCase(),
+      recruiterEmail: (recruiterEmail || '').trim().toLowerCase(),
+      candidateName: candidateName || 'Candidate',
+      jobTitle,
+      companyName: companyName || 'Employer',
+      date,
+      time,
+      timezone: timezone || 'UTC',
+      meetingLink: meetingLink || 'https://meet.google.com/new',
+      notes: notes || '',
+      status: 'scheduled',
+      scheduledAt: new Date(),
+    };
+
+    const result = await interviewsCollection.insertOne(interviewDoc);
+
+    // Create high-priority notification for the candidate
+    if (notificationsCollection) {
+      await notificationsCollection.insertOne({
+        recipientEmail: applicantEmail.trim().toLowerCase(),
+        title: `Interview Scheduled! 📅`,
+        message: `${companyName || 'The employer'} invited you for an interview for "${jobTitle}" on ${date} at ${time} (${timezone || 'UTC'}).`,
+        type: 'interview_scheduled',
+        link: meetingLink || '/dashboard/seeker/applications',
+        isRead: false,
+        createdAt: new Date(),
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Interview invitation sent successfully!',
+      interviewId: result.insertedId,
+    });
+  } catch (error) {
+    console.error('POST /api/interviews error:', error);
+    res.status(500).json({ success: false, message: 'Internal server error.' });
+  }
+});
+
+// GET /api/interviews — Get scheduled interviews
+app.get('/api/interviews', async (req, res) => {
+  try {
+    const { email, role } = req.query;
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+
+    const emailClean = email.trim().toLowerCase();
+    const filter = role === 'recruiter'
+      ? { recruiterEmail: { $regex: `^${emailClean}$`, $options: 'i' } }
+      : { applicantEmail: { $regex: `^${emailClean}$`, $options: 'i' } };
+
+    const interviews = await interviewsCollection
+      .find(filter)
+      .sort({ scheduledAt: -1 })
+      .toArray();
+
+    res.status(200).json({ success: true, total: interviews.length, interviews });
+  } catch (error) {
+    console.error('GET /api/interviews error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch interviews.' });
   }
 });
 
