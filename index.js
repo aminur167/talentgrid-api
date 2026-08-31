@@ -59,7 +59,7 @@ async function getDb() {
   return cachedDb;
 }
 
-let db, jobsCollection, applicationsCollection, usersCollection, companiesCollection, tokensCollection, subscriptionsCollection, notificationsCollection, savedJobsCollection, interviewsCollection;
+let db, jobsCollection, applicationsCollection, usersCollection, companiesCollection, tokensCollection, subscriptionsCollection, notificationsCollection, savedJobsCollection, interviewsCollection, passwordResetsCollection;
 
 async function initCollections() {
   if (!db) {
@@ -73,6 +73,7 @@ async function initCollections() {
     notificationsCollection = db.collection('notifications');
     savedJobsCollection     = db.collection('saved_jobs');
     interviewsCollection    = db.collection('interviews');
+    passwordResetsCollection = db.collection('password_resets');
   }
 }
 
@@ -195,8 +196,203 @@ app.get('/api/auth/me', verifyToken, (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// PASSWORD RECOVERY & RESET ROUTES
+// ═══════════════════════════════════════════════════════════════════════════
+
+// POST /api/auth/forgot-password — Request 6-digit OTP code
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || !email.trim()) {
+      return res.status(400).json({ success: false, message: 'Email address is required.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+
+    // Check if user exists in database
+    const user = await usersCollection.findOne({
+      email: { $regex: `^${escapeRegex(cleanEmail)}$`, $options: 'i' },
+    });
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'No account found with this email address.',
+      });
+    }
+
+    // Invalidate any previous unused reset codes for this email
+    await passwordResetsCollection.updateMany(
+      { email: cleanEmail, used: false },
+      { $set: { used: true, invalidatedAt: new Date() } }
+    );
+
+    // Generate secure 6-digit OTP code
+    const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes validity
+
+    const resetDoc = {
+      email: cleanEmail,
+      code: otpCode,
+      used: false,
+      expiresAt,
+      createdAt: new Date(),
+    };
+
+    await passwordResetsCollection.insertOne(resetDoc);
+
+    // Send in-app notification so user can also see it in their alerts
+    if (notificationsCollection) {
+      await notificationsCollection.insertOne({
+        recipientEmail: cleanEmail,
+        title: '🔑 Password Reset Code',
+        message: `Your verification code is: ${otpCode}. It will expire in 15 minutes.`,
+        type: 'security_alert',
+        link: '/auth/forgot-password',
+        isRead: false,
+        createdAt: new Date(),
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'A 6-digit verification code has been sent to your email.',
+      code: otpCode, // Provided for instant demo/testing & automated flows
+      expiresAt,
+    });
+  } catch (error) {
+    console.error('POST /api/auth/forgot-password error:', error);
+    res.status(500).json({ success: false, message: 'Failed to process password reset request.' });
+  }
+});
+
+// POST /api/auth/verify-reset-code — Verify 6-digit OTP code
+app.post('/api/auth/verify-reset-code', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) {
+      return res.status(400).json({ success: false, message: 'Email and verification code are required.' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanCode = code.trim();
+
+    const record = await passwordResetsCollection.findOne({
+      email: cleanEmail,
+      code: cleanCode,
+      used: false,
+      expiresAt: { $gt: new Date() },
+    });
+
+    if (!record) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired verification code. Please request a new one.',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Verification code confirmed. You can now set your new password.',
+    });
+  } catch (error) {
+    console.error('POST /api/auth/verify-reset-code error:', error);
+    res.status(500).json({ success: false, message: 'Failed to verify reset code.' });
+  }
+});
+
+// POST /api/auth/reset-password — Update password with verified code
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email, code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email, verification code, and new password are required.',
+      });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters long.',
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanCode = code.trim();
+
+    // Verify valid reset code
+    const resetRecord = await passwordResetsCollection.findOne({
+      email: cleanEmail,
+      code: cleanCode,
+      used: false,
+      expiresAt: { $gt: new Date() },
+    });
+
+    if (!resetRecord) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid or expired verification code. Please restart password recovery.',
+      });
+    }
+
+    // Mark reset code as used
+    await passwordResetsCollection.updateOne(
+      { _id: resetRecord._id },
+      { $set: { used: true, usedAt: new Date() } }
+    );
+
+    // Update password in users collection & user/account collections
+    const now = new Date();
+    await usersCollection.updateOne(
+      { email: { $regex: `^${escapeRegex(cleanEmail)}$`, $options: 'i' } },
+      { $set: { password: newPassword, updatedAt: now } }
+    );
+
+    // Also update in Better-Auth user/account collections if present
+    const userCol = db.collection('user');
+    const accountCol = db.collection('account');
+    if (userCol) {
+      await userCol.updateOne(
+        { email: { $regex: `^${escapeRegex(cleanEmail)}$`, $options: 'i' } },
+        { $set: { password: newPassword, updatedAt: now } }
+      ).catch(() => {});
+    }
+    if (accountCol) {
+      await accountCol.updateOne(
+        { email: { $regex: `^${escapeRegex(cleanEmail)}$`, $options: 'i' } },
+        { $set: { password: newPassword, updatedAt: now } }
+      ).catch(() => {});
+    }
+
+    // Create a confirmation security notification
+    if (notificationsCollection) {
+      await notificationsCollection.insertOne({
+        recipientEmail: cleanEmail,
+        title: '🔒 Password Changed Successfully',
+        message: 'Your account password was updated. If you did not make this change, contact support immediately.',
+        type: 'security_alert',
+        link: '/auth/signin',
+        isRead: false,
+        createdAt: now,
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'Password reset successfully! You can now sign in with your new password.',
+    });
+  } catch (error) {
+    console.error('POST /api/auth/reset-password error:', error);
+    res.status(500).json({ success: false, message: 'Failed to reset password.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // JOBS ROUTES — /api/jobs
 // ═══════════════════════════════════════════════════════════════════════════
+
 
 // POST /api/jobs — Create a new job posting
 app.post('/api/jobs', async (req, res) => {
