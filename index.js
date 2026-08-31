@@ -827,6 +827,87 @@ app.get('/api/interviews', async (req, res) => {
   }
 });
 
+// GET /api/subscriptions — Get subscription status for a user
+app.get('/api/subscriptions', async (req, res) => {
+  try {
+    const { email, userId } = req.query;
+    if (!email && !userId) {
+      return res.status(400).json({ success: false, message: 'Email or userId is required.' });
+    }
+
+    const filter = email
+      ? { userEmail: { $regex: `^${email.trim()}$`, $options: 'i' } }
+      : { userId };
+
+    const subscription = await subscriptionsCollection.findOne(filter);
+
+    res.status(200).json({
+      success: true,
+      subscription: subscription || {
+        plan: 'free',
+        status: 'active',
+        userEmail: email || '',
+      },
+    });
+  } catch (error) {
+    console.error('GET /api/subscriptions error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch subscription.' });
+  }
+});
+
+// GET /api/seeker/profile — Get seeker profile from users collection
+app.get('/api/seeker/profile', async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+
+    const user = await usersCollection.findOne(
+      { email: { $regex: `^${email.trim()}$`, $options: 'i' } },
+      { projection: { password: 0, hashedPassword: 0 } }
+    );
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User profile not found.' });
+    }
+
+    res.status(200).json({ success: true, profile: user });
+  } catch (error) {
+    console.error('GET /api/seeker/profile error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch profile.' });
+  }
+});
+
+// PATCH /api/seeker/profile — Update seeker profile fields
+app.patch('/api/seeker/profile', async (req, res) => {
+  try {
+    const { email, ...updateFields } = req.body;
+    if (!email) {
+      return res.status(400).json({ success: false, message: 'Email is required.' });
+    }
+
+    // Remove sensitive fields from updates
+    delete updateFields.password;
+    delete updateFields.hashedPassword;
+    delete updateFields.role;
+
+    const result = await usersCollection.updateOne(
+      { email: { $regex: `^${email.trim()}$`, $options: 'i' } },
+      { $set: { ...updateFields, updatedAt: new Date() } }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({ success: false, message: 'User not found.' });
+    }
+
+    res.status(200).json({ success: true, message: 'Profile updated successfully.' });
+  } catch (error) {
+    console.error('PATCH /api/seeker/profile error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update profile.' });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SEEKER SPECIFIC ROUTES
 // ═══════════════════════════════════════════════════════════════════════════
